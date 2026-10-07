@@ -114,6 +114,10 @@ pool = httpcore.ConnectionPool(proxy=proxy)
 r = pool.request("GET", "https://www.example.com/")
 ```
 
+SOCKS5 replies may arrive across multiple TCP reads. Authentication and connection
+setup handle fragmented replies for IPv4, IPv6, and domain-name addresses. If the
+proxy disconnects before its reply is complete, a `ProxyError` is raised.
+
 ---
 
 # Reference

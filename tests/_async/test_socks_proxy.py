@@ -1,6 +1,116 @@
 import pytest
+from socksio.exceptions import ProtocolError
 
 import httpcore
+
+
+class SOCKS5MockStream(httpcore.AsyncMockStream):
+    async def read(self, max_bytes, timeout=None):
+        data = await super().read(max_bytes, timeout)
+        if len(data) > max_bytes:
+            self._buffer.insert(0, data[max_bytes:])
+            return data[:max_bytes]
+        return data
+
+
+class SOCKS5MockBackend(httpcore.AsyncMockBackend):
+    async def connect_tcp(self, *args, **kwargs):
+        return SOCKS5MockStream(list(self._buffer))
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("fragment_size", [1, 2, 8, 4096])
+@pytest.mark.parametrize("auth", [None, (b"username", b"password")])
+@pytest.mark.parametrize(
+    "reply",
+    [
+        b"\x05\x00\x00\x01\x7f\x00\x00\x01\x00\x50",
+        b"\x05\x00\x00\x04" + b"\x00" * 15 + b"\x01\x00\x50",
+        b"\x05\x00\x00\x03\x0bexample.com\x00\x50",
+    ],
+    ids=["ipv4", "ipv6", "domain"],
+)
+async def test_socks5_fragmented_replies(fragment_size, auth, reply):
+    replies = [b"\x05\x00"] if auth is None else [b"\x05\x02", b"\x01\x00"]
+    replies.append(reply)
+    fragments = [
+        packet[offset : offset + fragment_size]
+        for packet in replies
+        for offset in range(0, len(packet), fragment_size)
+    ]
+    backend = SOCKS5MockBackend(
+        fragments + [b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"]
+    )
+    async with httpcore.AsyncConnectionPool(
+        proxy=httpcore.Proxy("socks5://localhost:1080", auth=auth),
+        network_backend=backend,
+    ) as pool:
+        response = await pool.request("GET", "http://example.com")
+
+    assert response.status == 200
+    assert response.content == b"hello"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "replies, auth",
+    [
+        ([], None),
+        ([b"\x05"], None),
+        ([b"\x05\x02", b"\x01"], (b"username", b"password")),
+        ([b"\x05\x00", b"\x05\x00\x00"], None),
+        ([b"\x05\x00", b"\x05\x00\x00\x01\x7f\x00\x00\x01\x00"], None),
+        ([b"\x05\x00", b"\x05\x00\x00\x04" + b"\x00" * 15], None),
+        ([b"\x05\x00", b"\x05\x00\x00\x03"], None),
+        ([b"\x05\x00", b"\x05\x00\x00\x03\x0bexample"], None),
+    ],
+    ids=[
+        "empty-auth",
+        "partial-auth",
+        "partial-password",
+        "partial-header",
+        "partial-ipv4-port",
+        "partial-ipv6-address",
+        "missing-domain-length",
+        "partial-domain",
+    ],
+)
+async def test_socks5_disconnected_during_reply(replies, auth):
+    async with httpcore.AsyncConnectionPool(
+        proxy=httpcore.Proxy("socks5://localhost:1080", auth=auth),
+        network_backend=SOCKS5MockBackend(replies),
+    ) as pool:
+        with pytest.raises(httpcore.ProxyError, match="disconnected during SOCKS5"):
+            await pool.request("GET", "http://example.com")
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("auth", [None, (b"username", b"password")])
+async def test_socks5_reply_does_not_consume_http_response(auth):
+    replies = [b"\x05\x00"] if auth is None else [b"\x05\x02", b"\x01\x00"]
+    replies.append(
+        b"\x05\x00\x00\x01\x7f\x00\x00\x01\x00\x50"
+        b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"
+    )
+    async with httpcore.AsyncConnectionPool(
+        proxy=httpcore.Proxy("socks5://localhost:1080", auth=auth),
+        network_backend=SOCKS5MockBackend(replies),
+    ) as pool:
+        response = await pool.request("GET", "http://example.com")
+
+    assert response.status == 200
+    assert response.content == b"hello"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("header", [b"\x04\x00\x00\x01", b"\x05\x00\x00\xff"])
+async def test_socks5_invalid_reply_header(header):
+    async with httpcore.AsyncConnectionPool(
+        proxy=httpcore.Proxy("socks5://localhost:1080"),
+        network_backend=SOCKS5MockBackend([b"\x05\x00", header]),
+    ) as pool:
+        with pytest.raises(ProtocolError, match="Malformed reply"):
+            await pool.request("GET", "http://example.com")
 
 
 @pytest.mark.anyio

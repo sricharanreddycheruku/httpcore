@@ -4,6 +4,7 @@ import logging
 import ssl
 
 import socksio
+from socksio.exceptions import ProtocolError
 
 from .._backends.auto import AutoBackend
 from .._backends.base import AsyncNetworkBackend, AsyncNetworkStream
@@ -47,6 +48,17 @@ async def _init_socks5_connection(
     auth: tuple[bytes, bytes] | None = None,
 ) -> None:
     conn = socksio.socks5.SOCKS5Connection()
+    buffer = bytearray()
+
+    async def read_exactly(size: int) -> bytes:
+        while len(buffer) < size:
+            data = await stream.read(max_bytes=size - len(buffer))
+            if not data:
+                raise ProxyError("Proxy server disconnected during SOCKS5 handshake.")
+            buffer.extend(data)
+        data = bytes(buffer[:size])
+        del buffer[:size]
+        return data
 
     # Auth method request
     auth_method = (
@@ -59,7 +71,7 @@ async def _init_socks5_connection(
     await stream.write(outgoing_bytes)
 
     # Auth method response
-    incoming_bytes = await stream.read(max_bytes=4096)
+    incoming_bytes = await read_exactly(2)
     response = conn.receive_data(incoming_bytes)
     assert isinstance(response, socksio.socks5.SOCKS5AuthReply)
     if response.method != auth_method:
@@ -78,7 +90,7 @@ async def _init_socks5_connection(
         await stream.write(outgoing_bytes)
 
         # Username/password response
-        incoming_bytes = await stream.read(max_bytes=4096)
+        incoming_bytes = await read_exactly(2)
         response = conn.receive_data(incoming_bytes)
         assert isinstance(response, socksio.socks5.SOCKS5UsernamePasswordReply)
         if not response.success:
@@ -94,7 +106,16 @@ async def _init_socks5_connection(
     await stream.write(outgoing_bytes)
 
     # Connect response
-    incoming_bytes = await stream.read(max_bytes=4096)
+    incoming_bytes = await read_exactly(4)
+    if incoming_bytes[0] != 5 or incoming_bytes[3] not in (1, 3, 4):
+        raise ProtocolError("Malformed reply")
+    if incoming_bytes[3] == 3:
+        length = await read_exactly(1)
+        incoming_bytes += length
+        address_size = length[0]
+    else:
+        address_size = 4 if incoming_bytes[3] == 1 else 16
+    incoming_bytes += await read_exactly(address_size + 2)
     response = conn.receive_data(incoming_bytes)
     assert isinstance(response, socksio.socks5.SOCKS5Reply)
     if response.reply_code != socksio.socks5.SOCKS5ReplyCode.SUCCEEDED:
